@@ -1,3 +1,9 @@
+adtool (1.2.1) unstable; urgency=medium
+
+  * Install all build dependencies in automated release jobs.
+
+ -- Carlos Andrade <carlos@perezandrade.com>  Fri, 18 Sep 2026 22:26:00 +0100
+
 adtool (1.2.0) unstable; urgency=medium
 
   * Add native Debian packaging, manual page, and shell completions.
