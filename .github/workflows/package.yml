@@ -38,6 +38,7 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y ../adtool_*_all.deb
           adtool --version
           dpkg -L adtool
+          ls -l /usr/share/man/man1/adtool* || true
           test -x /usr/bin/adtool || { echo 'missing executable'; exit 1; }
           test -f /usr/share/man/man1/adtool.1.gz || { echo 'missing manual'; exit 1; }
           test -f /usr/share/bash-completion/completions/adtool || { echo 'missing Bash completion'; exit 1; }
