@@ -1,0 +1,37 @@
+#compdef adtool
+# Zsh completion for adtool. Maintainer: Carlos Andrade <carlos@perezandrade.com>
+
+_adtool() {
+  local context state line
+  typeset -A opt_args
+  _arguments -C \
+    '(-h --help)'{-h,--help}'[show help]' \
+    '(-V --version)'{-V,--version}'[show version]' \
+    '1:command:->command' \
+    '*::argument:->args'
+
+  case $state in
+    command)
+      _values command user group computer password policy whoami ;;
+    args)
+      case $line[1] in
+        user|u)
+          _arguments '*:pattern:' '(-g --groups)'{-g,--groups}'[show nested groups]' \
+            '(-c --count)'{-c,--count}'[count matches]' '--dept=[filter by department]:department:' \
+            '--title=[filter by title]:title:' '--expiring=[expiring within days]:days:' \
+            '--stale=[inactive for days]:days:' '--locked[only locked accounts]' \
+            '--csv[CSV output]' '--json[JSON output]' '--reset[reset password]' \
+            '--lock[disable account]' '--unlock[unlock and enable account]' ;;
+        group|g)
+          _arguments '*:pattern:' '(-m --members)'{-m,--members}'[show nested members]' \
+            '(-c --count)'{-c,--count}'[count by OU]' ;;
+        computer|c|pc)
+          _arguments '*:pattern:' '(-s --servers)'{-s,--servers}'[only servers]' \
+            '(-w --workstations)'{-w,--workstations}'[only workstations]' \
+            '(-c --count)'{-c,--count}'[count matches]' ;;
+        password|pw) _values action policy ;;
+      esac ;;
+  esac
+}
+
+_adtool "$@"

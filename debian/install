@@ -1,0 +1,4 @@
+adtool usr/bin
+contrib/adtool.bash usr/share/bash-completion/completions
+contrib/_adtool usr/share/zsh/vendor-completions
+adtool.config.example usr/share/doc/adtool/examples
