@@ -65,14 +65,51 @@ use 30 or more. The precise `lastLogon` is per-DC and not replicated at all.
 
 ## Install
 
+### Installer
+
 ```sh
 git clone https://github.com/cfpandrade/adtool
 cd adtool
 ./install.sh
 ```
 
-That puts `adtool` in `~/.local/bin`, drops a starter config in
-`~/.config/adtool/config`, and tells you if any dependency is missing.
+That puts `adtool` in `~/.local/bin`, installs Bash and Zsh completions plus the
+manual page, and writes a starter config to `~/.config/adtool/config`. Existing
+configuration is never overwritten.
+
+The installer supports custom and system-wide locations, previews, and clean
+uninstallation:
+
+```sh
+./install.sh --help
+./install.sh --dry-run
+./install.sh --prefix "$HOME/.local"
+sudo ./install.sh --system
+./install.sh --uninstall              # keeps your configuration
+./install.sh --uninstall --purge      # also removes configuration
+```
+
+### Debian and Ubuntu
+
+Download the `.deb` from the matching GitHub release and install it with APT,
+which resolves runtime dependencies automatically:
+
+```sh
+sudo apt install ./adtool_1.2.0_all.deb
+```
+
+The Debian package deliberately does not create files in a user's home
+directory. Copy the packaged example when you first configure it:
+
+```sh
+mkdir -p ~/.config/adtool
+cp /usr/share/doc/adtool/examples/adtool.config.example ~/.config/adtool/config
+chmod 600 ~/.config/adtool/config
+```
+
+Maintainers can build the package with `make deb`. Tags named `v*` run the test
+matrix on Debian and Ubuntu, build the package, generate `SHA256SUMS`, and
+publish both files to GitHub Releases.
 
 Needs `ldapsearch`, `ldapmodify`, `klist`, `python3` and `iconv`:
 

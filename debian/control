@@ -1,0 +1,16 @@
+Source: adtool
+Section: admin
+Priority: optional
+Maintainer: Carlos Andrade <carlos@perezandrade.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Homepage: https://github.com/cfpandrade/adtool
+Rules-Requires-Root: no
+
+Package: adtool
+Architecture: all
+Depends: bash, coreutils, krb5-user, ldap-utils, libc-bin, python3, ${misc:Depends}
+Description: Active Directory command-line client using Kerberos
+ Query and administer Active Directory using an existing Kerberos ticket.
+ Results are rendered as readable tables, CSV, or JSON, while account writes
+ use a sealed GSSAPI session.

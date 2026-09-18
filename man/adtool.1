@@ -1,0 +1,106 @@
+.TH ADTOOL 1 "2026-09-18" "adtool 1.2.0" "User Commands"
+.SH NAME
+adtool \- read and administer Active Directory over Kerberos
+.SH SYNOPSIS
+.B adtool user
+.RI [ pattern ]
+.RI [ options ]
+.br
+.B adtool group
+.RI [ pattern ]
+.RI [ options ]
+.br
+.B adtool computer
+.RI [ pattern ]
+.RI [ options ]
+.br
+.B adtool password policy
+.br
+.B adtool whoami
+.SH DESCRIPTION
+.B adtool
+queries Active Directory using the current Kerberos ticket and renders aligned
+tables, CSV, or JSON. It can also reset passwords, disable accounts, and unlock
+accounts over a sealed GSSAPI connection.
+.SH USER OPTIONS
+.TP
+.BR \-g , " --groups"
+Show nested group membership.
+.TP
+.BR \-c , " --count" [=KEY]
+Count by department, title, OU, or status.
+.TP
+.BI --dept " NAME"
+Filter by department prefix.
+.TP
+.BI --title " NAME"
+Filter by title prefix.
+.TP
+.BI --expiring " DAYS"
+Show passwords expiring within the given number of days.
+.TP
+.BI --stale " DAYS"
+Show accounts with no recent logon.
+.TP
+.B --locked
+Show accounts currently locked by Active Directory.
+.TP
+.BR --csv , " --json"
+Produce machine-readable output.
+.TP
+.BR --reset , " --lock" , " --unlock"
+Perform the selected action on an exact login after confirmation.
+.SH GROUP OPTIONS
+.TP
+.BR \-m , " --members"
+Show nested members.
+.TP
+.BR \-c , " --count"
+Count groups by OU.
+.SH COMPUTER OPTIONS
+.TP
+.BR \-s , " --servers"
+Show only server operating systems.
+.TP
+.BR \-w , " --workstations"
+Show only non-server systems.
+.TP
+.BR \-c , " --count" [=KEY]
+Count by operating system, version, or OU.
+.SH CONFIGURATION
+The default configuration file is
+.IR ~/.config/adtool/config .
+Set
+.B AD_CONFIG
+to use another path. Environment variables override values read from the file.
+.TP
+.B AD_LDAP_URI
+LDAP URI of a domain controller.
+.TP
+.B AD_BASE_DN
+Active Directory search base.
+.TP
+.B AD_KINIT_PRINCIPAL
+Principal suggested when no Kerberos ticket exists.
+.TP
+.B AD_LOCKOUT_MINUTES
+Fallback lockout duration for controllers that do not return their computed
+lockout state. Zero means accounts remain locked until explicitly unlocked.
+.SH SECURITY
+Reads use GSSAPI authentication. Writes require a sealed GSSAPI session with a
+minimum security strength factor of 128. Passwords are read without terminal
+echo and are not stored in files or command-line arguments.
+.SH EXIT STATUS
+Zero indicates success. A non-zero status indicates invalid input, no matching
+objects, a missing Kerberos ticket, or an LDAP failure.
+.SH FILES
+.TP
+.I ~/.config/adtool/config
+Per-user configuration.
+.SH AUTHOR
+Carlos Andrade <carlos@perezandrade.com>
+.SH SEE ALSO
+.BR ldapsearch (1),
+.BR ldapmodify (1),
+.BR kinit (1),
+.BR klist (1)

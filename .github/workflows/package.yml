@@ -1,0 +1,62 @@
+name: Test and package
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install lint tools
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Test and lint
+        run: make test lint
+
+  package-test:
+    strategy:
+      matrix:
+        image: ['debian:stable-slim', 'ubuntu:24.04']
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential debhelper devscripts git
+      - uses: actions/checkout@v4
+      - name: Build package
+        run: dpkg-buildpackage -us -uc -b
+      - name: Install and verify package
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get install -y ../adtool_*_all.deb
+          adtool --version
+          test -x /usr/bin/adtool
+          test -f /usr/share/man/man1/adtool.1.gz
+          test -f /usr/share/bash-completion/completions/adtool
+          test -f /usr/share/zsh/vendor-completions/_adtool
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [quality, package-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y debhelper devscripts
+      - name: Build package and checksums
+        run: |
+          dpkg-buildpackage -us -uc -b
+          sha256sum ../adtool_*_all.deb > SHA256SUMS
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" ../adtool_*_all.deb SHA256SUMS --generate-notes

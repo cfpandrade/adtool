@@ -1,0 +1,6 @@
+adtool (1.2.0) unstable; urgency=medium
+
+  * Add native Debian packaging, manual page, and shell completions.
+  * Improve the portable installer with uninstall and dry-run support.
+
+ -- Carlos Andrade <carlos@perezandrade.com>  Fri, 18 Sep 2026 12:00:00 +0100
