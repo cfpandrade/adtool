@@ -7,8 +7,9 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/adtool-installer.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin"
 
+TRUE_BIN=$(type -P true)
 for executable in ldapsearch ldapmodify ldapwhoami klist python3 iconv base64; do
-  ln -s "$(command -v true)" "$TMP/bin/$executable"
+  ln -s "$TRUE_BIN" "$TMP/bin/$executable"
 done
 
 export PATH="$TMP/bin:/usr/bin:/bin"
