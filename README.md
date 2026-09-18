@@ -95,7 +95,7 @@ Download the `.deb` from the matching GitHub release and install it with APT,
 which resolves runtime dependencies automatically:
 
 ```sh
-sudo apt install ./adtool_1.2.0_all.deb
+sudo apt install ./adtool_1.2.1_all.deb
 ```
 
 The Debian package deliberately does not create files in a user's home

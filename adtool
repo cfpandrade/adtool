@@ -3,7 +3,7 @@
 # adtool - Active Directory lookups and account actions over Kerberos
 #
 # Author:  Carlos Andrade  ---  carlos@perezandrade.com
-# Version: 1.2.0
+# Version: 1.2.1
 #
 # Reads and writes AD through ldapsearch/ldapmodify using your existing
 # Kerberos ticket. Writes go over a sealed (encrypted) GSSAPI session.
@@ -42,7 +42,7 @@ AD_LOCKOUT_MINUTES=${AD_LOCKOUT_MINUTES:-15}
 LDAP_MATCHING_RULE_IN_CHAIN=1.2.840.113556.1.4.1941   # AD nested-membership rule
 
 PROG=${0##*/}
-VERSION=1.2.0
+VERSION=1.2.1
 
 usage() {
   cat <<__HELP__
