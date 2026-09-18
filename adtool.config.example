@@ -13,7 +13,7 @@ AD_BASE_DN=DC=example,DC=lan
 # in that message; adtool never reads a password or a keytab itself.
 AD_KINIT_PRINCIPAL=admin@EXAMPLE.LAN
 
-# Your domain's lockout observation window, in minutes.  Used to decide
-# whether a lockoutTime is still in effect.  'adtool policy' prints the real
-# value your DC is enforcing.
+# Fallback lockout duration in minutes for older DCs that do not return
+# msDS-User-Account-Control-Computed.  Use 0 when accounts remain locked until
+# an administrator unlocks them.  'adtool policy' prints the live duration.
 AD_LOCKOUT_MINUTES=15

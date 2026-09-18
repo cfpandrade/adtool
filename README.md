@@ -36,10 +36,10 @@ handles each one:
 
 **Lockout is a timestamp, not a flag.** AD stores `lockoutTime`, the moment the
 account tripped the bad-password threshold. It is never cleared when the
-lockout expires, so a non-zero value tells you nothing on its own. Whether the
-account is locked *now* depends on how long ago that was versus the domain's
-lockout window, which is why `--locked` is computed on the client and why
-`AD_LOCKOUT_MINUTES` exists.
+lockout expires, so a non-zero value tells you nothing on its own. On current
+domain controllers, `adtool` asks for `msDS-User-Account-Control-Computed`, so
+the controller's effective policy is authoritative (including indefinite
+lockouts). `AD_LOCKOUT_MINUTES` provides a client-side fallback for older DCs.
 
 **Password expiry is constructed.** `msDS-UserPasswordExpiryTimeComputed` is
 not stored anywhere; the DC calculates it per request from `pwdLastSet` and the
@@ -93,6 +93,10 @@ AD_KINIT_PRINCIPAL=admin@EXAMPLE.LAN
 AD_LOCKOUT_MINUTES=15
 ```
 
+`AD_LOCKOUT_MINUTES` is only used when a controller does not return its
+computed lockout state. Set it to the domain's lockout duration, or `0` when
+an administrator must unlock accounts.
+
 Setting any of these in the environment overrides the file for that run, which
 is handy for reaching a second domain:
 
@@ -134,6 +138,11 @@ adtool group vpn -m                # every member, nested included
 adtool computer -s -c=ou           # servers, counted per OU
 adtool password policy             # the live policy, including PSOs
 ```
+
+For groups whose direct `member` attribute exceeds the DC's range limit, the
+MEMBERS column shows the returned lower bound with a `+` (for example,
+`1500+`) instead of pretending that a truncated value is exact. `-m` still
+uses a server-side nested-membership query.
 
 Tables shrink to your terminal so every entry stays on one line, with clipped
 values ending in `…`. For anything you intend to process, ask for

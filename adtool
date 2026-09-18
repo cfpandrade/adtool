@@ -3,7 +3,7 @@
 # adtool - Active Directory lookups and account actions over Kerberos
 #
 # Author:  Carlos Andrade  ---  carlos@perezandrade.com
-# Version: 1.1.0
+# Version: 1.2.0
 #
 # Reads and writes AD through ldapsearch/ldapmodify using your existing
 # Kerberos ticket. Writes go over a sealed (encrypted) GSSAPI session.
@@ -26,6 +26,8 @@ if [[ -r $AD_CONFIG ]]; then
   _saved=$(for v in AD_LDAP_URI AD_BASE_DN AD_KINIT_PRINCIPAL AD_LOCKOUT_MINUTES; do
              [[ -n ${!v:-} ]] && printf '%s=%q\n' "$v" "${!v}"
            done)
+  # The path is deliberately user-selectable; the config format is shell.
+  # shellcheck disable=SC1090
   . "$AD_CONFIG"
   eval "$_saved"
   unset _saved
@@ -35,10 +37,12 @@ AD_LDAP_URI=${AD_LDAP_URI:-ldap://dc1.example.lan}
 AD_BASE_DN=${AD_BASE_DN:-DC=example,DC=lan}
 AD_KINIT_PRINCIPAL=${AD_KINIT_PRINCIPAL:-admin@EXAMPLE.LAN}
 AD_LOCKOUT_MINUTES=${AD_LOCKOUT_MINUTES:-15}
+[[ $AD_LOCKOUT_MINUTES =~ ^[0-9]+$ ]] \
+  || { printf '%s: AD_LOCKOUT_MINUTES must be zero or a positive integer\n' "${0##*/}" >&2; exit 2; }
 LDAP_MATCHING_RULE_IN_CHAIN=1.2.840.113556.1.4.1941   # AD nested-membership rule
 
 PROG=${0##*/}
-VERSION=1.1.0
+VERSION=1.2.0
 
 usage() {
   cat <<__HELP__
@@ -130,7 +134,8 @@ PASSWORD POLICY ---------------------------------------------------------------
 
 STATUS COLUMN
   enabled / DISABLED (userAccountControl bit 2) / LOCKED (too many bad
-  passwords, clears itself after ${AD_LOCKOUT_MINUTES} minutes).
+  passwords, as reported by the domain controller). AD_LOCKOUT_MINUTES is a
+  fallback for older controllers; 0 means an administrator must unlock it.
 
 OUTPUT WIDTH
   Columns shrink to fit the terminal so every entry stays on one line, and
@@ -164,14 +169,24 @@ check_ticket() {
 # ldap_search <filter> [attrs...] -> unwrapped LDIF, paged, comments stripped
 ldap_search() {
   local filter=$1; shift
+  local err rc
+  err=$(mktemp "${TMPDIR:-/tmp}/adtool-ldap.XXXXXX") || die "cannot create a temporary error file"
   ldapsearch -LLL -o ldif-wrap=no -E pr=1000/noprompt -Y GSSAPI -Q \
-    -H "$AD_LDAP_URI" -b "$AD_BASE_DN" "$filter" "$@" 2>/dev/null | grep -v '^#'
+    -H "$AD_LDAP_URI" -b "$AD_BASE_DN" "$filter" "$@" 2>"$err" | sed '/^#/d'
+  rc=${PIPESTATUS[0]}
+  if (( rc != 0 )); then
+    printf '%s: LDAP search failed against %s\n' "$PROG" "$AD_LDAP_URI" >&2
+    sed 's/^/  /' "$err" >&2
+  fi
+  rm -f "$err"
+  return "$rc"
 }
 
 # ldap_modify <dn> <change lines...> -> modify over a sealed GSSAPI session
 ldap_modify() {
-  local dn=$1; shift
-  { printf 'dn: %s\nchangetype: modify\n' "$dn"; printf '%s\n' "$@"; } \
+  local dn=$1 dn64; shift
+  dn64=$(printf '%s' "$dn" | base64 | tr -d '\n')
+  { printf 'dn:: %s\nchangetype: modify\n' "$dn64"; printf '%s\n' "$@"; } \
     | ldapmodify -Y GSSAPI -Q -O minssf=128 -H "$AD_LDAP_URI" >/dev/null
 }
 
@@ -186,6 +201,22 @@ confirm() {
   local r
   read -r -n1 -p "$1 [y/N] " r; printf '\n'
   [[ $r == [yY] ]]
+}
+
+# Print all decoded values of one LDIF attribute, one per line.  In
+# particular this handles base64-encoded DNs (`dn:: ...`) correctly.
+ldif_values() {
+  python3 -c 'import base64, sys
+attr = sys.argv[1].lower()
+for raw in sys.stdin.read().splitlines():
+    if ":" not in raw: continue
+    key, value = raw.split(":", 1)
+    if key.split(";", 1)[0].lower() != attr: continue
+    if value.startswith(":"):
+        try: value = base64.b64decode(value[1:].strip()).decode("utf-8", "replace")
+        except Exception: value = value[1:].strip()
+    else: value = value.strip()
+    print(value)' "$1"
 }
 
 # LDIF on stdin -> aligned table.  Usage: ... | table attr1 attr2 ...
@@ -211,8 +242,11 @@ for raw in sys.stdin.read().splitlines():
         except Exception: v = v[1:].strip()
     else:
         v = v.strip()
-    k = k.split(';')[0]                 # drop ;range=0-1499 style suffixes
+    ranged = ';range=' in k
+    partial = ranged and not k.endswith('-*')
+    k = k.split(';')[0]
     cur.setdefault(k, []).append(v)
+    if partial: cur['__partial_' + k] = ['1']
 if cur: entries.append(cur)
 if not entries: sys.exit(1)
 
@@ -227,8 +261,10 @@ def cell(e, a):
     vals = e.get(a, [])
     if a == 'userAccountControl':
         if vals and int(vals[0]) & 2: return 'DISABLED'
+        computed = int((e.get('msDS-User-Account-Control-Computed') or ['0'])[0] or 0)
+        if computed & 0x10: return 'LOCKED'
         lt = int((e.get('lockoutTime') or ['0'])[0] or 0)
-        if lt and NOW_FT - lt < LOCKOUT: return 'LOCKED'
+        if lt and (LOCKOUT == 0 or NOW_FT - lt < LOCKOUT): return 'LOCKED'
         return 'enabled'
     if a == 'ou':
         parts = [x for x in e.get('dn', [''])[0].split(',') if x.upper().startswith('OU=')]
@@ -249,7 +285,7 @@ def cell(e, a):
         ft = int((vals or ['0'])[0] or 0)
         if not ft: return 'never'
         return time.strftime('%Y-%m-%d', time.localtime(ft / 10**7 - 11644473600))
-    if a == 'member':   return str(len(vals))
+    if a == 'member':   return str(len(vals)) + ('+' if e.get('__partial_member') else '')
     if a == 'memberOf': return str(len(vals))
     if a == 'objectClass':
         return 'group' if 'group' in vals else ('computer' if 'computer' in vals else 'user')
@@ -318,8 +354,10 @@ def value(e):
     if key == 'status':
         uac = int((e.get('userAccountControl') or ['0'])[0] or 0)
         if uac & 2: return 'DISABLED'
+        computed = int((e.get('msDS-User-Account-Control-Computed') or ['0'])[0] or 0)
+        if computed & 0x10: return 'LOCKED'
         lt = int((e.get('lockoutTime') or ['0'])[0] or 0)
-        if lt and NOW_FT - lt < LOCKOUT: return 'LOCKED'
+        if lt and (LOCKOUT == 0 or NOW_FT - lt < LOCKOUT): return 'LOCKED'
         return 'enabled'
     return (e.get(key) or ['(not set)'])[0]
 
@@ -379,8 +417,9 @@ def ft_of(e, attr):
 
 def keep(e):
     if want_locked:
+        computed = ft_of(e, 'msDS-User-Account-Control-Computed')
         lt = ft_of(e, 'lockoutTime')
-        if not (lt and NOW_FT - lt < LOCKOUT): return False
+        if not (computed & 0x10 or (lt and (LOCKOUT == 0 or NOW_FT - lt < LOCKOUT))): return False
     if expiring is not None:
         ft = ft_of(e, 'msDS-UserPasswordExpiryTimeComputed')
         if ft >= NEVER: return False                    # never expires
@@ -506,10 +545,11 @@ cmd_user_action() {
   local login=$1 action=$2 ldif dn uac
   check_ticket
   ldif=$(ldap_search "(&(objectCategory=person)(objectClass=user)(sAMAccountName=$(esc "$login")))" \
-           sAMAccountName displayName userAccountControl lockoutTime)
+           sAMAccountName displayName userAccountControl lockoutTime \
+           msDS-User-Account-Control-Computed) || die "could not look up '$login'"
   [[ -z ${ldif//[[:space:]]/} ]] && die "no user with login exactly '$login'"
   printf '%s\n' "$ldif" | table sAMAccountName displayName ou userAccountControl
-  dn=$(printf '%s\n' "$ldif" | sed -n 's/^dn: //p' | head -1)
+  dn=$(printf '%s\n' "$ldif" | ldif_values dn | head -1)
   uac=$(printf '%s\n' "$ldif" | sed -n 's/^userAccountControl: //p' | head -1)
 
   case $action in
@@ -531,7 +571,7 @@ cmd_user_action() {
       [[ -n $pw1 ]] || die "empty password, aborted"
       [[ $pw1 == "$pw2" ]] || die "passwords do not match, aborted"
       confirm "Reset the password of '$login'?" || die "aborted"
-      b64=$(printf '"%s"' "$pw1" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)
+      b64=$(printf '"%s"' "$pw1" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\n')
       if ldap_modify "$dn" "replace: unicodePwd" "unicodePwd:: $b64"; then
         printf "Password of '%s' has been reset.\n" "$login"
       else
@@ -545,14 +585,15 @@ cmd_user_action() {
 cmd_user() {
   local pattern="" show_groups=0 action="" do_count=0 count_by=dept
   local dept="" title="" expiring="" stale="" locked=0 fmt="" need=""
+  local actions=0 formats=0 patterns=0
   while (( $# )); do
     case $1 in
       -g|--groups)               show_groups=1 ;;
       -c|--count)                do_count=1 ;;
       -c=*|--count=*)            do_count=1; count_by=${1#*=} ;;
-      -r|--reset|--reset-password) action=reset ;;
-      -l|--lock|--disable)       action=lock ;;
-      -u|--unlock|--enable)      action=unlock ;;
+      -r|--reset|--reset-password) action=reset; (( actions += 1 )) ;;
+      -l|--lock|--disable)       action=lock; (( actions += 1 )) ;;
+      -u|--unlock|--enable)      action=unlock; (( actions += 1 )) ;;
       --dept|--department)       need=$1; shift; dept=${1:-} ;;
       --dept=*|--department=*)   dept=${1#*=} ;;
       --title)                   need=$1; shift; title=${1:-} ;;
@@ -562,17 +603,20 @@ cmd_user() {
       --stale)                   need=$1; shift; stale=${1:-} ;;
       --stale=*)                 stale=${1#*=} ;;
       --locked)                  locked=1 ;;
-      --csv)                     fmt=csv ;;
-      --json)                    fmt=json ;;
+      --csv)                     fmt=csv; (( formats += 1 )) ;;
+      --json)                    fmt=json; (( formats += 1 )) ;;
       -h|--help)                 usage; return 0 ;;
       -*)                        die "unknown option '$1' (try $PROG --help)" ;;
-      *)                         pattern=$1 ;;
+      *)                         pattern=$1; (( patterns += 1 )) ;;
     esac
     (( $# )) || die "$need needs a value"
     shift
   done
-  [[ -z $expiring || $expiring == +([0-9]) ]] || die "--expiring needs a number of days"
-  [[ -z $stale    || $stale    == +([0-9]) ]] || die "--stale needs a number of days"
+  [[ -z $expiring || $expiring =~ ^[0-9]+$ ]] || die "--expiring needs a number of days"
+  [[ -z $stale    || $stale    =~ ^[0-9]+$ ]] || die "--stale needs a number of days"
+  (( actions <= 1 )) || die "choose only one of --reset, --lock or --unlock"
+  (( formats <= 1 )) || die "choose only one of --csv or --json"
+  (( patterns <= 1 )) || die "only one user pattern is allowed"
 
   if [[ -n $action ]]; then
     [[ -n $pattern ]] || die "--$action needs the exact login"
@@ -606,7 +650,8 @@ cmd_user() {
   local ldif
   ldif=$(ldap_search "(&${parts})" sAMAccountName displayName mail department title \
            userAccountControl lockoutTime lastLogonTimestamp \
-           msDS-UserPasswordExpiryTimeComputed)
+           msDS-UserPasswordExpiryTimeComputed msDS-User-Account-Control-Computed) \
+    || die "could not search users"
 
   local -a fargs=()
   [[ -n $expiring ]] && fargs+=("expiring=$expiring")
@@ -638,7 +683,7 @@ cmd_user() {
     printf '\nGroups of %s (nested included):\n' "${sam:-$dn}"
     ldap_search "(member:${LDAP_MATCHING_RULE_IN_CHAIN}:=$(esc "$dn"))" cn \
       | sed -n 's/^cn: //p' | sort -f | sed 's/^/  /'
-  done < <(printf '%s\n' "$ldif" | sed -n 's/^dn: //p')
+  done < <(printf '%s\n' "$ldif" | ldif_values dn)
   printf '\n  (Domain Users is the primary group and never appears in memberOf.\n'
   printf "   Run 'id <login>@%s' to see it.)\n" "${AD_BASE_DN//,DC=/.}" | sed 's/DC=//'
 }
@@ -675,7 +720,7 @@ cmd_group() {
     local p; p=$(esc "$pattern")
     filter="(&(objectClass=group)(|(cn=${p}*)(sAMAccountName=${p}*)))"
   fi
-  ldif=$(ldap_search "$filter" sAMAccountName description member)
+  ldif=$(ldap_search "$filter" sAMAccountName description member) || die "could not search groups"
   [[ -z ${ldif//[[:space:]]/} ]] && { printf "No groups matching '%s'\n" "${pattern:-*}"; exit 1; }
   if (( do_count )); then
     printf '%s\n' "$ldif" | count "$ckey" "$clabel"; return 0
@@ -690,8 +735,9 @@ cmd_group() {
     printf '\nMembers of %s (nested included):\n' "$cn"
     ldap_search "(memberOf:${LDAP_MATCHING_RULE_IN_CHAIN}:=$(esc "$dn"))" \
         sAMAccountName displayName objectClass userAccountControl lockoutTime \
+        msDS-User-Account-Control-Computed \
       | table sAMAccountName displayName objectClass ou userAccountControl | sed 's/^/  /'
-  done < <(printf '%s\n' "$ldif" | sed -n 's/^dn: //p')
+  done < <(printf '%s\n' "$ldif" | ldif_values dn)
 }
 
 cmd_policy() {
@@ -705,16 +751,17 @@ cmd_policy() {
   [[ -z ${head//[[:space:]]/} ]] && die "could not read the domain policy from $AD_LDAP_URI"
   pso=$(ldap_search "(objectClass=msDS-PasswordSettings)" \
           cn msDS-PasswordSettingsPrecedence msDS-MinimumPasswordLength \
-          msDS-MaximumPasswordAge msDS-PasswordComplexityEnabled msDS-PSOAppliesTo)
+          msDS-MaximumPasswordAge msDS-PasswordComplexityEnabled msDS-PSOAppliesTo) \
+    || die "could not search fine-grained password policies"
   printf '%s\n\n%s\n' "$head" "$pso" | policy_render "$dom"
 }
 
 cmd_computer() {
-  local pattern="" kind="" do_count=0 count_by=os a
+  local pattern="" kind="" do_count=0 count_by=os a saw_server=0 saw_workstation=0
   for a in "$@"; do
     case $a in
-      -s|--servers)        kind=server ;;
-      -w|--workstations)   kind=workstation ;;
+      -s|--servers)        kind=server; saw_server=1 ;;
+      -w|--workstations)   kind=workstation; saw_workstation=1 ;;
       -c|--count)          do_count=1 ;;
       -c=*|--count=*)      do_count=1; count_by=${a#*=} ;;
       -h|--help)           usage; return 0 ;;
@@ -722,7 +769,7 @@ cmd_computer() {
       *)                   pattern=$a ;;
     esac
   done
-  [[ $kind == server && $kind == workstation ]] && die "-s and -w are exclusive"
+  (( saw_server && saw_workstation )) && die "-s and -w are exclusive"
 
   local ckey clabel
   case $count_by in
@@ -745,7 +792,8 @@ cmd_computer() {
 
   local ldif
   ldif=$(ldap_search "(&${parts})" cn operatingSystem operatingSystemVersion \
-           lastLogonTimestamp userAccountControl)
+           lastLogonTimestamp userAccountControl msDS-User-Account-Control-Computed) \
+    || die "could not search computers"
   [[ -z ${ldif//[[:space:]]/} ]] && { printf "No computers matching '%s'\n" "${pattern:-*}"; exit 1; }
 
   if (( do_count )); then

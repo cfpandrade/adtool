@@ -20,7 +20,7 @@ else
 fi
 
 missing=()
-for c in ldapsearch ldapmodify klist python3 iconv; do
+for c in ldapsearch ldapmodify ldapwhoami klist python3 iconv base64; do
     command -v "$c" >/dev/null || missing+=("$c")
 done
 if [ ${#missing[@]} -gt 0 ]; then
