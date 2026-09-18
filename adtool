@@ -1,0 +1,782 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# adtool - Active Directory lookups and account actions over Kerberos
+#
+# Author:  Carlos Andrade  ---  carlos@perezandrade.com
+# Version: 1.1.0
+#
+# Reads and writes AD through ldapsearch/ldapmodify using your existing
+# Kerberos ticket. Writes go over a sealed (encrypted) GSSAPI session.
+#
+# Point it at your domain with a config file or environment variables.
+# The config file is plain shell, read before the defaults below:
+#
+#   ~/.config/adtool/config     (override with AD_CONFIG=/other/path)
+#     AD_LDAP_URI=ldap://dc1.example.lan
+#     AD_BASE_DN=DC=example,DC=lan
+#     AD_KINIT_PRINCIPAL=admin@EXAMPLE.LAN
+#     AD_LOCKOUT_MINUTES=15
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+AD_CONFIG=${AD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/adtool/config}
+if [[ -r $AD_CONFIG ]]; then
+  # the environment wins over the file, so save what is already set, source
+  # the file, then put the environment back on top
+  _saved=$(for v in AD_LDAP_URI AD_BASE_DN AD_KINIT_PRINCIPAL AD_LOCKOUT_MINUTES; do
+             [[ -n ${!v:-} ]] && printf '%s=%q\n' "$v" "${!v}"
+           done)
+  . "$AD_CONFIG"
+  eval "$_saved"
+  unset _saved
+fi
+
+AD_LDAP_URI=${AD_LDAP_URI:-ldap://dc1.example.lan}
+AD_BASE_DN=${AD_BASE_DN:-DC=example,DC=lan}
+AD_KINIT_PRINCIPAL=${AD_KINIT_PRINCIPAL:-admin@EXAMPLE.LAN}
+AD_LOCKOUT_MINUTES=${AD_LOCKOUT_MINUTES:-15}
+LDAP_MATCHING_RULE_IN_CHAIN=1.2.840.113556.1.4.1941   # AD nested-membership rule
+
+PROG=${0##*/}
+VERSION=1.1.0
+
+usage() {
+  cat <<__HELP__
+$PROG $VERSION - Active Directory lookups and account actions (Kerberos)
+by Carlos Andrade  ---  carlos@perezandrade.com
+
+USAGE
+  $PROG user     [pattern] [filters] [-g] [-c[=KEY]] [--csv | --json]
+  $PROG user     <login> --reset | --lock | --unlock
+  $PROG group    [pattern] [-m] [-c]
+  $PROG computer [pattern] [-s | -w] [-c[=os|version|ou]]
+  $PROG password policy
+  $PROG whoami | -h, --help | -V, --version
+
+USER --------------------------------------------------------------------------
+  $PROG user [pattern]   Users whose login, name, surname or email starts with
+  pattern.  With no pattern, every user in the domain.
+  Columns: LOGIN  NAME  EMAIL  DEPT  TITLE  OU  STATUS  PWD EXPIRES
+
+  -g, --groups        All groups of each match, nested included.  Needs a
+                      pattern.
+  -c, --count         Counts per department instead of the table.  Also
+                      -c=title, -c=ou, -c=status.
+
+  Filters - combinable, and they stack on top of pattern:
+    --dept NAME       Department starts with NAME.   Filtered by the DC.
+    --title NAME      Job title starts with NAME.    Filtered by the DC.
+    --expiring N      Password expires within N days.  Accounts that must
+                      change at next logon count in, ones that never expire
+                      do not.
+    --stale N         No logon for N or more days, never-logged-on included,
+                      and adds a LAST LOGON column.  lastLogonTimestamp is
+                      replicated lazily, up to 14 days behind, so use 30+.
+    --locked          Only accounts locked out right now.
+
+  Output:
+    --csv, --json     Machine-readable instead of the table: full values, no
+                      clipping, no @domain folding, no totals.  JSON keys are
+                      LDAP attribute names, CSV headers the column titles.
+
+  Actions - exact login, always confirmed:
+    -r, --reset       Reset the password.  Prompts twice, never echoes.
+    -l, --lock        Disable the account.
+    -u, --unlock      Clear the lockout and re-enable the account.
+
+    $PROG user smi
+    $PROG user jsmith -g
+    $PROG user --dept Engineering
+    $PROG user --expiring 14
+    $PROG user --locked
+    $PROG user --stale 90
+    $PROG user -c=status
+    $PROG user --dept Sales --json | jq -r '.[].mail'
+    $PROG user jsmith --unlock
+
+GROUP -------------------------------------------------------------------------
+  $PROG group [pattern]  Groups whose name starts with pattern.  With no
+  pattern, every group in the domain.
+  Columns: GROUP  DESCRIPTION  OU  MEMBERS
+
+  -m, --members       All members of each match, nested included.  Needs a
+                      pattern.
+  -c, --count         Counts per OU instead of the table.
+
+    $PROG group vpn
+    $PROG group vpn -m
+    $PROG group -c
+
+COMPUTER ----------------------------------------------------------------------
+  $PROG computer [pattern]  Computers whose name or DNS host name starts with
+  pattern.  With no pattern, every computer in the domain.
+  Columns: NAME  OS  BUILD  LAST LOGON  OU  STATUS
+
+  -s, --servers       Only servers - operatingSystem contains "Server".
+  -w, --workstations  Only non-servers.  Includes objects with no
+                      operatingSystem set, joined but never booted.
+  -c, --count         Counts per operating system instead of the table.
+                      -c=version counts by OS build, -c=ou by OU.
+
+    $PROG computer ws-
+    $PROG computer -s
+    $PROG computer -s -c
+    $PROG computer -s -c=ou
+
+PASSWORD POLICY ---------------------------------------------------------------
+  $PROG password policy  The live password and lockout policy of the domain,
+  plus any fine-grained (PSO) policy that overrides it.  'policy' alone works
+  too.  The PWD EXPIRES column of 'user' is computed by the DC from this.
+
+STATUS COLUMN
+  enabled / DISABLED (userAccountControl bit 2) / LOCKED (too many bad
+  passwords, clears itself after ${AD_LOCKOUT_MINUTES} minutes).
+
+OUTPUT WIDTH
+  Columns shrink to fit the terminal so every entry stays on one line, and
+  clipped values end in "…".  Override with AD_TERM_WIDTH=200 $PROG ...
+  Piping through grep drops the header - keep it with:
+    $PROG user | grep -E 'LOGIN|^--|Engineering'
+
+REQUIREMENTS
+  A valid Kerberos ticket:  kinit $AD_KINIT_PRINCIPAL
+  Password resets, locks and unlocks need delegated rights in AD.
+
+CONFIG
+  AD_LDAP_URI, AD_BASE_DN, AD_KINIT_PRINCIPAL and AD_LOCKOUT_MINUTES are
+  read from $AD_CONFIG
+  if that file exists.  Setting any of them in the environment overrides the
+  file for that run.
+
+AUTHOR
+  Carlos Andrade  ---  carlos@perezandrade.com
+  https://github.com/cfpandrade/adtool   MIT licensed.
+__HELP__
+}
+
+die() { printf '%s: %s\n' "$PROG" "$1" >&2; exit "${2:-1}"; }
+
+check_ticket() {
+  klist -s 2>/dev/null && return 0
+  die "no valid Kerberos ticket. Run:  kinit $AD_KINIT_PRINCIPAL"
+}
+
+# ldap_search <filter> [attrs...] -> unwrapped LDIF, paged, comments stripped
+ldap_search() {
+  local filter=$1; shift
+  ldapsearch -LLL -o ldif-wrap=no -E pr=1000/noprompt -Y GSSAPI -Q \
+    -H "$AD_LDAP_URI" -b "$AD_BASE_DN" "$filter" "$@" 2>/dev/null | grep -v '^#'
+}
+
+# ldap_modify <dn> <change lines...> -> modify over a sealed GSSAPI session
+ldap_modify() {
+  local dn=$1; shift
+  { printf 'dn: %s\nchangetype: modify\n' "$dn"; printf '%s\n' "$@"; } \
+    | ldapmodify -Y GSSAPI -Q -O minssf=128 -H "$AD_LDAP_URI" >/dev/null
+}
+
+# escape a value for use inside an LDAP filter (RFC 4515)
+esc() {
+  local s=$1
+  s=${s//\\/\\5c}; s=${s//\(/\\28}; s=${s//\)/\\29}; s=${s//\*/\\2a}
+  printf '%s' "$s"
+}
+
+confirm() {
+  local r
+  read -r -n1 -p "$1 [y/N] " r; printf '\n'
+  [[ $r == [yY] ]]
+}
+
+# LDIF on stdin -> aligned table.  Usage: ... | table attr1 attr2 ...
+read -r -d '' TABLE_PY <<'PY'
+import sys, os, time, base64
+specs = [a.split('=', 1) for a in sys.argv[1:]]   # attr, or attr=LABEL
+attrs = [x[0] for x in specs]
+labels = {x[0]: x[1] for x in specs if len(x) == 2}
+LOCKOUT = int(os.environ.get('AD_LOCKOUT_MINUTES', '15')) * 60 * 10**7
+NOW_FT = int((time.time() + 11644473600) * 10**7)
+entries, cur = [], {}
+for raw in sys.stdin.read().splitlines():
+    if not raw.strip():
+        if cur: entries.append(cur); cur = {}
+        continue
+    if raw.startswith('#') or ':' not in raw: continue
+    if raw.startswith('dn:'):
+        if cur: entries.append(cur)
+        cur = {}
+    k, v = raw.split(':', 1)
+    if v.startswith(':'):
+        try: v = base64.b64decode(v[1:].strip()).decode('utf-8', 'replace')
+        except Exception: v = v[1:].strip()
+    else:
+        v = v.strip()
+    k = k.split(';')[0]                 # drop ;range=0-1499 style suffixes
+    cur.setdefault(k, []).append(v)
+if cur: entries.append(cur)
+if not entries: sys.exit(1)
+
+FMT = os.environ.get('AD_FORMAT', '')
+
+# every address in the same domain?  drop it from the column, note it below.
+# never for csv/json - an export has to carry the full value.
+_doms = {v.split('@')[-1].lower() for e in entries for v in e.get('mail', []) if '@' in v}
+MAILDOM = _doms.pop() if len(_doms) == 1 and not FMT else None
+
+def cell(e, a):
+    vals = e.get(a, [])
+    if a == 'userAccountControl':
+        if vals and int(vals[0]) & 2: return 'DISABLED'
+        lt = int((e.get('lockoutTime') or ['0'])[0] or 0)
+        if lt and NOW_FT - lt < LOCKOUT: return 'LOCKED'
+        return 'enabled'
+    if a == 'ou':
+        parts = [x for x in e.get('dn', [''])[0].split(',') if x.upper().startswith('OU=')]
+        return '/'.join(x[3:] for x in reversed(parts)) or '(no OU)'
+    if a == 'msDS-UserPasswordExpiryTimeComputed':
+        ft = int((vals or ['0'])[0] or 0)
+        if not ft: return 'must change'
+        if ft >= 0x7FFFFFFFFFFFFFFF: return 'never'
+        secs = ft / 10**7 - 11644473600
+        day = time.strftime('%Y-%m-%d', time.localtime(secs))
+        if FMT: return day                    # exports carry the bare date
+        left = int((secs - time.time()) // 86400)
+        return '%s (%dd)' % (day, left) if left >= 0 else '%s EXPIRED' % day
+    if a == 'mail' and MAILDOM:
+        return ', '.join(v[:-(len(MAILDOM) + 1)] if v.lower().endswith('@' + MAILDOM)
+                         else v for v in vals)
+    if a in ('lastLogonTimestamp', 'whenCreated'):
+        ft = int((vals or ['0'])[0] or 0)
+        if not ft: return 'never'
+        return time.strftime('%Y-%m-%d', time.localtime(ft / 10**7 - 11644473600))
+    if a == 'member':   return str(len(vals))
+    if a == 'memberOf': return str(len(vals))
+    if a == 'objectClass':
+        return 'group' if 'group' in vals else ('computer' if 'computer' in vals else 'user')
+    return ', '.join(vals)
+
+rows = [[cell(e, a) for a in attrs] for e in entries]
+rows.sort(key=lambda r: r[0].lower())
+head = {'sAMAccountName':'LOGIN','displayName':'NAME','mail':'EMAIL','department':'DEPT',
+        'title':'TITLE','userAccountControl':'STATUS','description':'DESCRIPTION',
+        'member':'MEMBERS','memberOf':'GROUPS','objectClass':'TYPE','cn':'GROUP','ou':'OU',
+        'operatingSystem':'OS','operatingSystemVersion':'BUILD',
+        'lastLogonTimestamp':'LAST LOGON','dNSHostName':'HOSTNAME',
+        'msDS-UserPasswordExpiryTimeComputed':'PWD EXPIRES'}
+hdr = [labels.get(a, head.get(a, a.upper())) for a in attrs]
+if FMT == 'csv':
+    import csv
+    out = csv.writer(sys.stdout)
+    out.writerow(hdr); out.writerows(rows)
+    sys.exit(0)
+if FMT == 'json':
+    import json
+    print(json.dumps([dict(zip(attrs, r)) for r in rows], indent=2))
+    sys.exit(0)
+
+w = [max([len(h)] + [len(r[i]) for r in rows]) for i, h in enumerate(hdr)]
+
+# shrink the roomiest column, one char at a time, until a row fits one line
+TERM = int(os.environ.get('AD_TERM_WIDTH') or 0) or 120
+mins = [max(len(h), 8) for h in hdr]
+avail = TERM - 2 * (len(w) - 1)
+while sum(w) > avail:
+    i = max(range(len(w)), key=lambda j: w[j] - mins[j])
+    if w[i] <= mins[i]: break
+    w[i] -= 1
+
+def clip(v, n): return v if len(v) <= n else v[:n-1] + '…'
+fmt = '  '.join('{:<%d}' % x for x in w)
+print(fmt.format(*[clip(h, w[i]) for i, h in enumerate(hdr)]))
+print(fmt.format(*['-'*x for x in w]))
+for r in rows: print(fmt.format(*[clip(c, w[i]) for i, c in enumerate(r)]).rstrip())
+print('')
+if MAILDOM and 'mail' in attrs: print('(emails omit @%s)' % MAILDOM)
+print('%d %s' % (len(rows), 'entry' if len(rows) == 1 else 'entries'))
+PY
+
+table() {
+  local cols=${AD_TERM_WIDTH:-}
+  [[ -n $cols ]] || cols=$( { stty size </dev/tty; } 2>/dev/null | awk '{print $2}' )
+  [[ -n $cols ]] || cols=$(tput cols 2>/dev/null)
+  AD_TERM_WIDTH=${cols:-120} AD_LOCKOUT_MINUTES=$AD_LOCKOUT_MINUTES \
+    python3 -c "$TABLE_PY" "$@"
+}
+
+# LDIF on stdin -> counts per value.  Usage: ... | count <attr|ou> <LABEL>
+read -r -d '' COUNT_PY <<'PY'
+import sys, os, time, base64
+key, label = sys.argv[1], sys.argv[2]
+LOCKOUT = int(os.environ.get('AD_LOCKOUT_MINUTES', '15')) * 60 * 10**7
+NOW_FT = int((time.time() + 11644473600) * 10**7)
+counts, seen, cur = {}, [0], {}
+
+def value(e):
+    if key == 'ou':
+        parts = [x for x in e.get('dn', [''])[0].split(',') if x.upper().startswith('OU=')]
+        return '/'.join(x[3:] for x in reversed(parts)) or '(no OU)'
+    if key == 'status':
+        uac = int((e.get('userAccountControl') or ['0'])[0] or 0)
+        if uac & 2: return 'DISABLED'
+        lt = int((e.get('lockoutTime') or ['0'])[0] or 0)
+        if lt and NOW_FT - lt < LOCKOUT: return 'LOCKED'
+        return 'enabled'
+    return (e.get(key) or ['(not set)'])[0]
+
+def tally(e):
+    if not e: return
+    seen[0] += 1
+    v = value(e)
+    counts[v] = counts.get(v, 0) + 1
+
+for raw in sys.stdin.read().splitlines():
+    if not raw.strip():
+        tally(cur); cur = {}
+        continue
+    if raw.startswith('#') or ':' not in raw: continue
+    if raw.startswith('dn:'):
+        tally(cur); cur = {}
+    k, v = raw.split(':', 1)
+    if v.startswith(':'):
+        try: v = base64.b64decode(v[1:].strip()).decode('utf-8', 'replace')
+        except Exception: v = v[1:].strip()
+    else:
+        v = v.strip()
+    cur.setdefault(k.split(';')[0], []).append(v)
+tally(cur)
+
+total = seen[0]
+if not total: sys.exit(1)
+w = max([len(label)] + [len(k) for k in counts])
+fmt = '{:<%d}  {:>5}  {:>6}' % w
+print(fmt.format(label, 'COUNT', 'SHARE'))
+print(fmt.format('-'*w, '-'*5, '-'*6))
+for v, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0].lower())):
+    print(fmt.format(v, n, '%.1f%%' % (100.0 * n / total)))
+print(fmt.format('-'*w, '-'*5, '-'*6))
+print(fmt.format('TOTAL', total, '100.0%'))
+PY
+
+count() { AD_LOCKOUT_MINUTES=$AD_LOCKOUT_MINUTES python3 -c "$COUNT_PY" "$@"; }
+
+# LDIF on stdin -> only the entries that pass.  Usage: ... | ldif_filter k=v ...
+# msDS-UserPasswordExpiryTimeComputed is a constructed attribute and lockout
+# state is time-relative, so neither can go in an LDAP filter - both are
+# applied here, on the entries the DC already sent.
+read -r -d '' FILTER_PY <<'PY'
+import sys, os, time, base64
+LOCKOUT = int(os.environ.get('AD_LOCKOUT_MINUTES', '15')) * 60 * 10**7
+NOW = time.time()
+NOW_FT = int((NOW + 11644473600) * 10**7)
+NEVER = 0x7FFFFFFFFFFFFFFF
+opts = dict(a.split('=', 1) for a in sys.argv[1:])
+expiring = int(opts['expiring']) if 'expiring' in opts else None
+stale = int(opts['stale']) if 'stale' in opts else None
+want_locked = 'locked' in opts
+
+def ft_of(e, attr):
+    return int((e.get(attr) or ['0'])[0] or 0)
+
+def keep(e):
+    if want_locked:
+        lt = ft_of(e, 'lockoutTime')
+        if not (lt and NOW_FT - lt < LOCKOUT): return False
+    if expiring is not None:
+        ft = ft_of(e, 'msDS-UserPasswordExpiryTimeComputed')
+        if ft >= NEVER: return False                    # never expires
+        if ft and (ft / 10**7 - 11644473600 - NOW) / 86400 > expiring:
+            return False                                # 0 = must change, keep
+    if stale is not None:
+        ft = ft_of(e, 'lastLogonTimestamp')
+        if ft and (NOW - (ft / 10**7 - 11644473600)) / 86400 < stale: return False
+    return True
+
+out, block, cur = [], [], {}
+for raw in sys.stdin.read().splitlines():
+    if not raw.strip() or (raw.startswith('dn:') and block):
+        if block and keep(cur): out.append(block)
+        block, cur = [], {}
+        if not raw.strip(): continue
+    block.append(raw)
+    if ':' not in raw or raw.startswith('#'): continue
+    k, v = raw.split(':', 1)
+    if v.startswith(':'):
+        try: v = base64.b64decode(v[1:].strip()).decode('utf-8', 'replace')
+        except Exception: v = v[1:].strip()
+    else:
+        v = v.strip()
+    cur.setdefault(k.split(';')[0], []).append(v)
+if block and keep(cur): out.append(block)
+
+for b in out:
+    print('\n'.join(b)); print('')
+PY
+
+ldif_filter() { AD_LOCKOUT_MINUTES=$AD_LOCKOUT_MINUTES python3 -c "$FILTER_PY" "$@"; }
+
+# LDIF of the domain head (+ any PSO) on stdin -> readable policy
+read -r -d '' POLICY_PY <<'PY'
+import sys, base64
+dom = sys.argv[1]
+entries, cur = [], {}
+for raw in sys.stdin.read().splitlines():
+    if not raw.strip():
+        if cur: entries.append(cur); cur = {}
+        continue
+    if raw.startswith('#') or ':' not in raw: continue
+    if raw.startswith('dn:'):
+        if cur: entries.append(cur)
+        cur = {}
+    k, v = raw.split(':', 1)
+    if v.startswith(':'):
+        try: v = base64.b64decode(v[1:].strip()).decode('utf-8', 'replace')
+        except Exception: v = v[1:].strip()
+    else:
+        v = v.strip()
+    cur.setdefault(k.split(';')[0], []).append(v)
+if cur: entries.append(cur)
+
+def one(e, k, d=''):
+    return (e.get(k) or [d])[0]
+
+def dur(v):
+    'AD duration: negative 100-ns intervals, 0 = not set, min int64 = never'
+    n = int(v or 0)
+    if n == 0: return 'not set'
+    n = abs(n)
+    if n >= 0x7FFFFFFFFFFFFFFF: return 'never'
+    secs = n // 10**7
+    for size, name in ((86400, 'day'), (3600, 'hour'), (60, 'minute')):
+        if secs % size == 0:
+            q = secs // size
+            return '%d %s%s' % (q, name, '' if q == 1 else 's')
+    return '%d seconds' % secs
+
+FLAGS = [(0x01, 'complexity required'), (0x02, 'no anonymous change'),
+         (0x04, 'no cleartext change'), (0x08, 'admins can be locked out'),
+         (0x10, 'reversible encryption stored'), (0x20, 'password change refused')]
+
+def row(label, value):
+    print('  %-22s %s' % (label, value))
+
+dompol = [e for e in entries if 'minPwdLength' in e]
+psos   = [e for e in entries if 'msDS-MinimumPasswordLength' in e]
+
+if dompol:
+    e = dompol[0]
+    props = int(one(e, 'pwdProperties', '0'))
+    maxage = int(one(e, 'maxPwdAge', '0'))
+    print('Password policy - %s   (domain default)\n' % dom)
+    row('Minimum length', '%s characters' % one(e, 'minPwdLength', '?'))
+    if props & 0x01:
+        row('Complexity', 'required - 3 of 4 classes: upper, lower, digit, symbol')
+        row('', 'and must not contain the login or parts of the full name')
+    else:
+        row('Complexity', 'not required')
+    row('History', 'last %s passwords cannot be reused' % one(e, 'pwdHistoryLength', '?'))
+    row('Maximum age', 'never expires' if maxage == 0 else dur(maxage))
+    row('Minimum age', dur(one(e, 'minPwdAge', '0')))
+    thr = int(one(e, 'lockoutThreshold', '0'))
+    row('Lockout threshold', 'never locks out' if thr == 0 else '%d failed attempts' % thr)
+    if thr:
+        ld = one(e, 'lockoutDuration', '0')
+        row('Lockout duration', 'until an admin unlocks' if int(ld or 0) == 0 else dur(ld))
+        row('Bad count resets in', dur(one(e, 'lockOutObservationWindow', '0')))
+    other = [n for b, n in FLAGS if b != 0x01 and props & b]
+    if other: row('Other flags', ', '.join(other))
+
+if psos:
+    print('\nFine-grained policies (msDS-PasswordSettings) - these override the')
+    print('domain default for the users and groups they apply to:\n')
+    for e in sorted(psos, key=lambda x: int(one(x, 'msDS-PasswordSettingsPrecedence', '0'))):
+        print('  %s   (precedence %s)' % (one(e, 'cn', '?'),
+                                          one(e, 'msDS-PasswordSettingsPrecedence', '?')))
+        row('  Minimum length', '%s characters' % one(e, 'msDS-MinimumPasswordLength', '?'))
+        row('  Maximum age', dur(one(e, 'msDS-MaximumPasswordAge', '0')))
+        row('  Complexity', one(e, 'msDS-PasswordComplexityEnabled', '?'))
+        row('  Applies to', '%d object(s)' % len(e.get('msDS-PSOAppliesTo', [])))
+else:
+    print('\nNo fine-grained (PSO) policies - the domain default applies to everyone.')
+PY
+
+policy_render() { python3 -c "$POLICY_PY" "$@"; }
+
+# --------------------------------------------------------------------------
+cmd_user_action() {
+  local login=$1 action=$2 ldif dn uac
+  check_ticket
+  ldif=$(ldap_search "(&(objectCategory=person)(objectClass=user)(sAMAccountName=$(esc "$login")))" \
+           sAMAccountName displayName userAccountControl lockoutTime)
+  [[ -z ${ldif//[[:space:]]/} ]] && die "no user with login exactly '$login'"
+  printf '%s\n' "$ldif" | table sAMAccountName displayName ou userAccountControl
+  dn=$(printf '%s\n' "$ldif" | sed -n 's/^dn: //p' | head -1)
+  uac=$(printf '%s\n' "$ldif" | sed -n 's/^userAccountControl: //p' | head -1)
+
+  case $action in
+    lock)
+      confirm "Disable (lock) account '$login'?" || die "aborted"
+      ldap_modify "$dn" "replace: userAccountControl" "userAccountControl: $(( uac | 2 ))" \
+        || die "lock rejected by the domain controller (rights?)"
+      printf "Account '%s' is now DISABLED.\n" "$login" ;;
+    unlock)
+      confirm "Unlock and enable account '$login'?" || die "aborted"
+      ldap_modify "$dn" "replace: lockoutTime" "lockoutTime: 0" "-" \
+                        "replace: userAccountControl" "userAccountControl: $(( uac & ~2 ))" \
+        || die "unlock rejected by the domain controller (rights?)"
+      printf "Account '%s' is now unlocked and enabled.\n" "$login" ;;
+    reset)
+      local pw1 pw2 b64
+      read -rs -p "New password for '$login': " pw1; printf '\n'
+      read -rs -p "Repeat new password: "        pw2; printf '\n'
+      [[ -n $pw1 ]] || die "empty password, aborted"
+      [[ $pw1 == "$pw2" ]] || die "passwords do not match, aborted"
+      confirm "Reset the password of '$login'?" || die "aborted"
+      b64=$(printf '"%s"' "$pw1" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)
+      if ldap_modify "$dn" "replace: unicodePwd" "unicodePwd:: $b64"; then
+        printf "Password of '%s' has been reset.\n" "$login"
+      else
+        printf '%s\n' "$PROG: reset rejected. Either you lack the rights, or the password breaks policy." \
+          "  Run '$PROG policy' for the live length, complexity and history rules." >&2
+        exit 1
+      fi ;;
+  esac
+}
+
+cmd_user() {
+  local pattern="" show_groups=0 action="" do_count=0 count_by=dept
+  local dept="" title="" expiring="" stale="" locked=0 fmt="" need=""
+  while (( $# )); do
+    case $1 in
+      -g|--groups)               show_groups=1 ;;
+      -c|--count)                do_count=1 ;;
+      -c=*|--count=*)            do_count=1; count_by=${1#*=} ;;
+      -r|--reset|--reset-password) action=reset ;;
+      -l|--lock|--disable)       action=lock ;;
+      -u|--unlock|--enable)      action=unlock ;;
+      --dept|--department)       need=$1; shift; dept=${1:-} ;;
+      --dept=*|--department=*)   dept=${1#*=} ;;
+      --title)                   need=$1; shift; title=${1:-} ;;
+      --title=*)                 title=${1#*=} ;;
+      --expiring)                need=$1; shift; expiring=${1:-} ;;
+      --expiring=*)              expiring=${1#*=} ;;
+      --stale)                   need=$1; shift; stale=${1:-} ;;
+      --stale=*)                 stale=${1#*=} ;;
+      --locked)                  locked=1 ;;
+      --csv)                     fmt=csv ;;
+      --json)                    fmt=json ;;
+      -h|--help)                 usage; return 0 ;;
+      -*)                        die "unknown option '$1' (try $PROG --help)" ;;
+      *)                         pattern=$1 ;;
+    esac
+    (( $# )) || die "$need needs a value"
+    shift
+  done
+  [[ -z $expiring || $expiring == +([0-9]) ]] || die "--expiring needs a number of days"
+  [[ -z $stale    || $stale    == +([0-9]) ]] || die "--stale needs a number of days"
+
+  if [[ -n $action ]]; then
+    [[ -n $pattern ]] || die "--$action needs the exact login"
+    cmd_user_action "$pattern" "$action"; return
+  fi
+  if [[ -z $pattern && $show_groups -eq 1 ]]; then
+    die "-g needs a pattern (listing groups for every user is not allowed)"
+  fi
+  local ckey clabel
+  if (( do_count )); then
+    (( show_groups )) && die "-c and -g cannot be combined"
+    [[ -n $fmt ]] && die "-c and --$fmt cannot be combined"
+    case $count_by in
+      dept|department) ckey=department; clabel=DEPT ;;
+      title)           ckey=title;      clabel=TITLE ;;
+      ou)              ckey=ou;         clabel=OU ;;
+      status)          ckey=status;     clabel=STATUS ;;
+      *) die "--count: use dept, title, ou or status (got '$count_by')" ;;
+    esac
+  fi
+
+  check_ticket
+  local parts="(objectCategory=person)(objectClass=user)"
+  if [[ -n $pattern ]]; then
+    local p; p=$(esc "$pattern")
+    parts+="(|(cn=${p}*)(sAMAccountName=${p}*)(sn=${p}*)(mail=${p}*))"
+  fi
+  [[ -n $dept ]]  && parts+="(department=$(esc "$dept")*)"
+  [[ -n $title ]] && parts+="(title=$(esc "$title")*)"
+
+  local ldif
+  ldif=$(ldap_search "(&${parts})" sAMAccountName displayName mail department title \
+           userAccountControl lockoutTime lastLogonTimestamp \
+           msDS-UserPasswordExpiryTimeComputed)
+
+  local -a fargs=()
+  [[ -n $expiring ]] && fargs+=("expiring=$expiring")
+  [[ -n $stale ]]    && fargs+=("stale=$stale")
+  (( locked ))       && fargs+=("locked=1")
+  if (( ${#fargs[@]} )) && [[ -n ${ldif//[[:space:]]/} ]]; then
+    ldif=$(printf '%s\n' "$ldif" | ldif_filter "${fargs[@]}")
+  fi
+  if [[ -z ${ldif//[[:space:]]/} ]]; then
+    (( ${#fargs[@]} )) && { printf 'No users match those filters.\n'; exit 1; }
+    printf "No users matching '%s'\n" "${pattern:-*}"; exit 1
+  fi
+  if (( do_count )); then
+    printf '%s\n' "$ldif" | count "$ckey" "$clabel"; return 0
+  fi
+
+  local -a cols=(sAMAccountName displayName mail department title ou
+                 userAccountControl msDS-UserPasswordExpiryTimeComputed)
+  [[ -n $stale ]] && cols+=(lastLogonTimestamp)
+  export AD_FORMAT=$fmt
+  printf '%s\n' "$ldif" | table "${cols[@]}"
+  [[ -n $fmt ]] && return 0
+  (( show_groups )) || return 0
+
+  local dn sam
+  while IFS= read -r dn; do
+    [[ -n $dn ]] || continue
+    sam=$(printf '%s\n' "$ldif" | awk -v d="dn: $dn" '$0==d{f=1} f&&/^sAMAccountName: /{print $2; exit}')
+    printf '\nGroups of %s (nested included):\n' "${sam:-$dn}"
+    ldap_search "(member:${LDAP_MATCHING_RULE_IN_CHAIN}:=$(esc "$dn"))" cn \
+      | sed -n 's/^cn: //p' | sort -f | sed 's/^/  /'
+  done < <(printf '%s\n' "$ldif" | sed -n 's/^dn: //p')
+  printf '\n  (Domain Users is the primary group and never appears in memberOf.\n'
+  printf "   Run 'id <login>@%s' to see it.)\n" "${AD_BASE_DN//,DC=/.}" | sed 's/DC=//'
+}
+
+cmd_group() {
+  local pattern="" show_members=0 do_count=0 count_by=ou a
+  for a in "$@"; do
+    case $a in
+      -m|--members) show_members=1 ;;
+      -c|--count)   do_count=1 ;;
+      -c=*|--count=*) do_count=1; count_by=${a#*=} ;;
+      -h|--help)    usage; return 0 ;;
+      -*)           die "unknown option '$a' (try $PROG --help)" ;;
+      *)            pattern=$a ;;
+    esac
+  done
+  if [[ -z $pattern && $show_members -eq 1 ]]; then
+    die "-m needs a pattern (listing members of every group is not allowed)"
+  fi
+  local ckey clabel
+  if (( do_count )); then
+    (( show_members )) && die "-c and -m cannot be combined"
+    case $count_by in
+      ou) ckey=ou; clabel=OU ;;
+      *)  die "--count: groups can only be counted by ou (got '$count_by')" ;;
+    esac
+  fi
+
+  check_ticket
+  local filter ldif
+  if [[ -z $pattern ]]; then
+    filter="(objectClass=group)"
+  else
+    local p; p=$(esc "$pattern")
+    filter="(&(objectClass=group)(|(cn=${p}*)(sAMAccountName=${p}*)))"
+  fi
+  ldif=$(ldap_search "$filter" sAMAccountName description member)
+  [[ -z ${ldif//[[:space:]]/} ]] && { printf "No groups matching '%s'\n" "${pattern:-*}"; exit 1; }
+  if (( do_count )); then
+    printf '%s\n' "$ldif" | count "$ckey" "$clabel"; return 0
+  fi
+  printf '%s\n' "$ldif" | table sAMAccountName=GROUP description ou member
+  (( show_members )) || return 0
+
+  local dn
+  while IFS= read -r dn; do
+    [[ -n $dn ]] || continue
+    local cn=${dn%%,*}; cn=${cn#CN=}
+    printf '\nMembers of %s (nested included):\n' "$cn"
+    ldap_search "(memberOf:${LDAP_MATCHING_RULE_IN_CHAIN}:=$(esc "$dn"))" \
+        sAMAccountName displayName objectClass userAccountControl lockoutTime \
+      | table sAMAccountName displayName objectClass ou userAccountControl | sed 's/^/  /'
+  done < <(printf '%s\n' "$ldif" | sed -n 's/^dn: //p')
+}
+
+cmd_policy() {
+  check_ticket
+  local dom=${AD_BASE_DN//,DC=/.}; dom=${dom#DC=}
+  local head pso
+  head=$(ldapsearch -LLL -o ldif-wrap=no -Y GSSAPI -Q -H "$AD_LDAP_URI" \
+           -b "$AD_BASE_DN" -s base '(objectClass=*)' \
+           minPwdLength pwdProperties pwdHistoryLength maxPwdAge minPwdAge \
+           lockoutThreshold lockoutDuration lockOutObservationWindow 2>/dev/null | grep -v '^#')
+  [[ -z ${head//[[:space:]]/} ]] && die "could not read the domain policy from $AD_LDAP_URI"
+  pso=$(ldap_search "(objectClass=msDS-PasswordSettings)" \
+          cn msDS-PasswordSettingsPrecedence msDS-MinimumPasswordLength \
+          msDS-MaximumPasswordAge msDS-PasswordComplexityEnabled msDS-PSOAppliesTo)
+  printf '%s\n\n%s\n' "$head" "$pso" | policy_render "$dom"
+}
+
+cmd_computer() {
+  local pattern="" kind="" do_count=0 count_by=os a
+  for a in "$@"; do
+    case $a in
+      -s|--servers)        kind=server ;;
+      -w|--workstations)   kind=workstation ;;
+      -c|--count)          do_count=1 ;;
+      -c=*|--count=*)      do_count=1; count_by=${a#*=} ;;
+      -h|--help)           usage; return 0 ;;
+      -*)                  die "unknown option '$a' (try $PROG --help)" ;;
+      *)                   pattern=$a ;;
+    esac
+  done
+  [[ $kind == server && $kind == workstation ]] && die "-s and -w are exclusive"
+
+  local ckey clabel
+  case $count_by in
+    os)           ckey=operatingSystem;        clabel=OS ;;
+    version|ver)  ckey=operatingSystemVersion; clabel=BUILD ;;
+    ou)           ckey=ou;                     clabel=OU ;;
+    *)            die "--count: use os, version or ou (got '$count_by')" ;;
+  esac
+
+  check_ticket
+  local parts="(objectClass=computer)"
+  case $kind in
+    server)      parts="${parts}(operatingSystem=*Server*)" ;;
+    workstation) parts="${parts}(!(operatingSystem=*Server*))" ;;
+  esac
+  if [[ -n $pattern ]]; then
+    local p; p=$(esc "$pattern")
+    parts="${parts}(|(cn=${p}*)(dNSHostName=${p}*))"
+  fi
+
+  local ldif
+  ldif=$(ldap_search "(&${parts})" cn operatingSystem operatingSystemVersion \
+           lastLogonTimestamp userAccountControl)
+  [[ -z ${ldif//[[:space:]]/} ]] && { printf "No computers matching '%s'\n" "${pattern:-*}"; exit 1; }
+
+  if (( do_count )); then
+    printf '%s\n' "$ldif" | count "$ckey" "$clabel"
+  else
+    printf '%s\n' "$ldif" \
+      | table cn=NAME operatingSystem operatingSystemVersion lastLogonTimestamp ou userAccountControl
+  fi
+}
+
+cmd_whoami() {
+  check_ticket
+  printf 'Ticket : %s\n' "$(klist 2>/dev/null | sed -n 's/^Default principal: //p')"
+  printf 'Server : %s\n' "$AD_LDAP_URI"
+  printf 'Base   : %s\n' "$AD_BASE_DN"
+  printf 'Bind as: %s\n' "$(ldapwhoami -Y GSSAPI -Q -H "$AD_LDAP_URI" 2>/dev/null)"
+}
+
+case ${1:-} in
+  user|u)          shift; cmd_user "$@" ;;
+  group|g)         shift; cmd_group "$@" ;;
+  computer|c|pc)   shift; cmd_computer "$@" ;;
+  password|pw)     shift
+                   case ${1:-} in
+                     policy|pol|'') cmd_policy ;;
+                     *)             die "unknown command 'password $1' (try $PROG --help)" ;;
+                   esac ;;
+  policy|pol)      shift; cmd_policy ;;
+  -V|--version)    printf '%s %s - Carlos Andrade  ---  carlos@perezandrade.com\n' "$PROG" "$VERSION" ;;
+  whoami)          shift; cmd_whoami ;;
+  -h|--help|help)  usage ;;
+  '')              usage; exit 1 ;;
+  *)               die "unknown command '$1' (try $PROG --help)" ;;
+esac

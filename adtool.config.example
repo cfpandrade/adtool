@@ -1,0 +1,19 @@
+# adtool configuration - plain shell, copy to ~/.config/adtool/config
+#
+# Any of these set in the environment overrides the value here for that run.
+
+# A domain controller to talk to.  ldap:// is fine: reads are signed and
+# writes are sealed by GSSAPI, so nothing crosses the wire in the clear.
+AD_LDAP_URI=ldap://dc1.example.lan
+
+# Search base - the domain, as a DN.
+AD_BASE_DN=DC=example,DC=lan
+
+# The principal adtool tells you to kinit when no ticket is found.  Only used
+# in that message; adtool never reads a password or a keytab itself.
+AD_KINIT_PRINCIPAL=admin@EXAMPLE.LAN
+
+# Your domain's lockout observation window, in minutes.  Used to decide
+# whether a lockoutTime is still in effect.  'adtool policy' prints the real
+# value your DC is enforcing.
+AD_LOCKOUT_MINUTES=15
