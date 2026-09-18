@@ -2,7 +2,7 @@ Source: adtool
 Section: admin
 Priority: optional
 Maintainer: Carlos Andrade <carlos@perezandrade.com>
-Build-Depends: debhelper-compat (= 13)
+Build-Depends: debhelper-compat (= 13), shellcheck
 Standards-Version: 4.7.0
 Homepage: https://github.com/cfpandrade/adtool
 Rules-Requires-Root: no
