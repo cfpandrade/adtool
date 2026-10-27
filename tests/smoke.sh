@@ -128,11 +128,12 @@ ls "$TMP"/cache/adtool/*.users >/dev/null 2>&1 || fail 'completion cache file'
 [[ $(stat -c %a "$TMP"/cache/adtool/*.users) == 600 ]] || fail 'cache must be private'
 ADTOOL_TEST_FIXTURE=error run __complete users j >"$TMP/out" 2>"$TMP/err" || fail 'complete must never fail'
 [[ ! -s $TMP/err ]] || fail 'complete must stay silent on errors'
-printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/bin/klist.none"
 rm -rf "$TMP/cache"
-( PATH="$TMP/nokinit:$PATH"; mkdir -p "$TMP/nokinit"; cp "$TMP/bin/klist.none" "$TMP/nokinit/klist"; chmod +x "$TMP/nokinit/klist"
-  [[ -z $(XDG_CACHE_HOME="$TMP/cache" AD_CONFIG=/dev/null "$ROOT/adtool" __complete users) ]] ) \
-  || fail 'no ticket, no suggestions'
+mkdir -p "$TMP/nokinit"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/nokinit/klist"
+chmod +x "$TMP/nokinit/klist"
+[[ -z $(PATH="$TMP/nokinit:$TMP/bin:$PATH" AD_CONFIG=/dev/null XDG_CACHE_HOME="$TMP/cache" \
+          "$ROOT/adtool" __complete users) ]] || fail 'no ticket, no suggestions'
 
 # the Bash script itself, driven the way readline drives it
 cat >"$TMP/complete.sh" <<'SH'
