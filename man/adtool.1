@@ -67,6 +67,20 @@ Show only non-server systems.
 .TP
 .BR \-c , " --count" [=KEY]
 Count by operating system, version, or OU.
+.SH SHELL COMPLETION
+.TP
+.B adtool completion bash
+Print the Bash completion script.
+.TP
+.B adtool completion zsh
+Print the Zsh completion script.
+.PP
+Completion offers commands, options, and names read from the directory:
+logins, group names, computer names, departments and titles. Names need a
+Kerberos ticket and are cached for
+.B AD_COMPLETE_TTL
+minutes (default 5, 0 disables the cache) in
+.IR ~/.cache/adtool .
 .SH CONFIGURATION
 The default configuration file is
 .IR ~/.config/adtool/config .

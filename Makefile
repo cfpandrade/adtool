@@ -1,5 +1,10 @@
 # Maintainer: Carlos Andrade <carlos@perezandrade.com>
-.PHONY: test lint deb clean
+.PHONY: test lint deb clean completions
+
+# the packaged completion scripts are generated from adtool itself
+completions:
+	./adtool completion bash > contrib/adtool.bash
+	./adtool completion zsh > contrib/_adtool
 
 test:
 	./tests/smoke.sh
