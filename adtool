@@ -43,6 +43,7 @@ LDAP_MATCHING_RULE_IN_CHAIN=1.2.840.113556.1.4.1941   # AD nested-membership rul
 
 PROG=${0##*/}
 VERSION=1.2.1
+LDAP_EXTRA=(-Q)    # extra ldapsearch options; completion adds a network timeout
 
 usage() {
   cat <<__HELP__
@@ -55,6 +56,7 @@ USAGE
   $PROG group    [pattern] [-m] [-c]
   $PROG computer [pattern] [-s | -w] [-c[=os|version|ou]]
   $PROG password policy
+  $PROG completion bash | zsh
   $PROG whoami | -h, --help | -V, --version
 
 USER --------------------------------------------------------------------------
@@ -132,6 +134,15 @@ PASSWORD POLICY ---------------------------------------------------------------
   plus any fine-grained (PSO) policy that overrides it.  'policy' alone works
   too.  The PWD EXPIRES column of 'user' is computed by the DC from this.
 
+COMPLETION
+  $PROG completion bash   Print the Bash completion script.
+  $PROG completion zsh    Print the Zsh completion script.
+  Besides commands and options it completes logins, group names, computer
+  names, departments and titles from the directory.  The lists are cached for
+  AD_COMPLETE_TTL minutes (default 5; 0 disables the cache) below
+  \$XDG_CACHE_HOME/adtool, and nothing is suggested without a Kerberos ticket.
+  Try it with:  eval "\$($PROG completion bash)"
+
 STATUS COLUMN
   enabled / DISABLED (userAccountControl bit 2) / LOCKED (too many bad
   passwords, as reported by the domain controller). AD_LOCKOUT_MINUTES is a
@@ -172,6 +183,7 @@ ldap_search() {
   local err rc
   err=$(mktemp "${TMPDIR:-/tmp}/adtool-ldap.XXXXXX") || die "cannot create a temporary error file"
   ldapsearch -LLL -o ldif-wrap=no -E pr=1000/noprompt -Y GSSAPI -Q \
+    "${LDAP_EXTRA[@]}" \
     -H "$AD_LDAP_URI" -b "$AD_BASE_DN" "$filter" "$@" 2>"$err" | sed '/^#/d'
   rc=${PIPESTATUS[0]}
   if (( rc != 0 )); then
@@ -812,6 +824,307 @@ cmd_whoami() {
   printf 'Bind as: %s\n' "$(ldapwhoami -Y GSSAPI -Q -H "$AD_LDAP_URI" 2>/dev/null)"
 }
 
+# ---------------------------------------------------------------------------
+# Shell completion.  flags_for is the single list of options: the Bash and
+# Zsh scripts below read it through the hidden "__flags" command instead of
+# keeping their own copy.  Each line is  option|value|description  where
+# value is "-" (none), "@dept" or "@title" (looked up in the directory),
+# "#" (a number) or "=a,b,c" (optional, written --opt=a).
+# ---------------------------------------------------------------------------
+flags_for() {
+  case ${1:-} in
+    top) cat <<'__FLAGS__'
+user|-|users, filters and account actions
+group|-|groups and their members
+computer|-|computers, servers and workstations
+password|-|password policy
+policy|-|password and lockout policy
+whoami|-|show the ticket and the bind identity
+completion|-|print a shell completion script
+-h|-|show help
+--help|-|show help
+-V|-|show version
+--version|-|show version
+__FLAGS__
+    ;;
+    user) cat <<'__FLAGS__'
+-g|-|all groups of each match
+--groups|-|all groups of each match
+-c|=dept,title,ou,status|count instead of listing
+--count|=dept,title,ou,status|count instead of listing
+--dept|@dept|department starts with
+--department|@dept|department starts with
+--title|@title|job title starts with
+--expiring|#|password expires within N days
+--stale|#|no logon for N days
+--locked|-|only locked accounts
+--csv|-|CSV output
+--json|-|JSON output
+-r|-|reset the password
+--reset|-|reset the password
+-l|-|disable the account
+--lock|-|disable the account
+-u|-|unlock and enable the account
+--unlock|-|unlock and enable the account
+-h|-|show help
+--help|-|show help
+__FLAGS__
+    ;;
+    group) cat <<'__FLAGS__'
+-m|-|all members of each match
+--members|-|all members of each match
+-c|=ou|count by OU
+--count|=ou|count by OU
+-h|-|show help
+--help|-|show help
+__FLAGS__
+    ;;
+    computer) cat <<'__FLAGS__'
+-s|-|only servers
+--servers|-|only servers
+-w|-|only workstations
+--workstations|-|only workstations
+-c|=os,version,ou|count instead of listing
+--count|=os,version,ou|count instead of listing
+-h|-|show help
+--help|-|show help
+__FLAGS__
+    ;;
+    password) printf 'policy|-|password and lockout policy\n' ;;
+    completion) printf 'bash|-|Bash completion script\nzsh|-|Zsh completion script\n' ;;
+  esac
+}
+
+# __complete <users|groups|computers|depts|titles> [prefix]
+# One candidate per line.  Never fails and never prints an error: it runs
+# while someone is pressing TAB.  Lists are cached AD_COMPLETE_TTL minutes.
+cmd_complete() {
+  local kind=${1:-} prefix=${2:-} filter attr
+  case $kind in
+    users)     filter='(&(objectCategory=person)(objectClass=user))'; attr=sAMAccountName ;;
+    groups)    filter='(objectClass=group)';                         attr=sAMAccountName ;;
+    computers) filter='(objectClass=computer)';                      attr=cn ;;
+    depts)     filter='(&(objectCategory=person)(objectClass=user)(department=*))'; attr=department ;;
+    titles)    filter='(&(objectCategory=person)(objectClass=user)(title=*))';      attr=title ;;
+    *)         return 0 ;;
+  esac
+  local ttl=${AD_COMPLETE_TTL:-5}
+  [[ $ttl =~ ^[0-9]+$ ]] || ttl=5
+  local dir=${XDG_CACHE_HOME:-$HOME/.cache}/adtool key file
+  key=$(printf '%s' "$AD_LDAP_URI $AD_BASE_DN" | cksum | cut -d' ' -f1)
+  file=$dir/$key.$kind
+  if [[ -z $(find "$file" -mmin "-$ttl" 2>/dev/null) ]] && klist -s 2>/dev/null; then
+    local ldif tmp
+    LDAP_EXTRA=(-Q -o nettimeout=5)
+    if ldif=$(ldap_search "$filter" "$attr" 2>/dev/null); then
+      ( umask 077
+        mkdir -p "$dir" 2>/dev/null \
+          && tmp=$(mktemp "$dir/.tmp.XXXXXX" 2>/dev/null) \
+          && printf '%s\n' "$ldif" | ldif_values "$attr" | LC_ALL=C sort -fu >"$tmp" \
+          && mv -f "$tmp" "$file" )
+    fi
+  fi
+  [[ -r $file ]] || return 0
+  P=$prefix awk 'BEGIN { p = tolower(ENVIRON["P"]) } NF && index(tolower($0), p) == 1' "$file"
+}
+
+cmd_completion() {
+  case ${1:-} in
+    bash) completion_bash ;;
+    zsh)  completion_zsh ;;
+    *)    die "usage: $PROG completion bash|zsh" 2 ;;
+  esac
+}
+
+completion_bash() {
+  cat <<'__BASH__'
+# Bash completion for adtool. Maintainer: Carlos Andrade <carlos@perezandrade.com>
+# Generated by 'adtool completion bash'; do not edit, change adtool instead.
+# Options come from 'adtool __flags' and names from 'adtool __complete'.
+# Bash 3.2 compatible.
+_adtool_complete() {
+  local bin=${COMP_WORDS[0]} cur prev cmd flag="" spec opt val i w
+  cur=${COMP_WORDS[COMP_CWORD]}
+  prev=${COMP_WORDS[COMP_CWORD-1]:-}
+  COMPREPLY=()
+
+  # '=' is a word break: "--count=ou" arrives as "--count" "=" "ou"
+  if [[ $cur == "=" ]]; then
+    cur=""; flag=$prev
+  elif [[ $prev == "=" ]]; then
+    flag=${COMP_WORDS[COMP_CWORD-2]:-}
+  elif [[ $prev == -* ]]; then
+    flag=$prev
+  fi
+
+  if (( COMP_CWORD == 1 )); then
+    _adtool_emit "$("$bin" __flags top 2>/dev/null)" "$cur"
+    return 0
+  fi
+
+  cmd=${COMP_WORDS[1]}
+  case $cmd in
+    u) cmd=user ;; g) cmd=group ;; c|pc) cmd=computer ;; pw) cmd=password ;;
+  esac
+  case $cmd in
+    user|group|computer|password|completion) ;;
+    *) return 0 ;;
+  esac
+  if [[ $cmd == password || $cmd == completion ]]; then
+    (( COMP_CWORD == 2 )) && _adtool_emit "$("$bin" __flags "$cmd" 2>/dev/null)" "$cur"
+    return 0
+  fi
+
+  spec=$("$bin" __flags "$cmd" 2>/dev/null)
+
+  # a value for the previous option?
+  if [[ -n $flag ]]; then
+    while IFS='|' read -r opt val _; do
+      [[ $opt == "$flag" ]] || continue
+      case $val in
+        @dept)  _adtool_names depts "$cur"; return 0 ;;
+        @title) _adtool_names titles "$cur"; return 0 ;;
+        '#')    return 0 ;;
+        =*)     if [[ $prev == "=" || ${COMP_WORDS[COMP_CWORD]} == "=" ]]; then
+                  for w in $(printf '%s' "${val#=}" | tr , ' '); do
+                    [[ $w == "$cur"* ]] && COMPREPLY[${#COMPREPLY[@]}]=$w
+                  done
+                  return 0
+                fi ;;
+      esac
+    done <<<"$spec"
+  fi
+
+  if [[ $cur == -* ]]; then
+    _adtool_emit "$spec" "$cur"
+    return 0
+  fi
+
+  # a name: logins for an account action, otherwise what the command searches
+  local action=0 kind=users
+  for (( i = 2; i < COMP_CWORD; i++ )); do
+    case ${COMP_WORDS[i]} in -r|--reset|-l|--lock|-u|--unlock) action=1 ;; esac
+  done
+  case $cmd in group) kind=groups ;; computer) kind=computers ;; esac
+  if [[ -z $cur && $action == 0 ]]; then
+    _adtool_emit "$spec" "$cur"
+  else
+    _adtool_names "$kind" "$cur"
+  fi
+  return 0
+}
+
+# _adtool_emit <spec lines> <prefix>: the options that start with prefix
+_adtool_emit() {
+  local opt
+  while IFS='|' read -r opt _; do
+    [[ -n $opt && $opt == "$2"* ]] && COMPREPLY[${#COMPREPLY[@]}]=$opt
+  done <<<"$1"
+}
+
+# _adtool_names <kind> <prefix>: directory names, shell-quoted
+_adtool_names() {
+  local line p=${2#[\"\']}
+  while IFS= read -r line; do
+    [[ -n $line ]] && COMPREPLY[${#COMPREPLY[@]}]=$(printf '%q' "$line")
+  done < <("${COMP_WORDS[0]}" __complete "$1" "$p" 2>/dev/null)
+}
+complete -F _adtool_complete adtool
+__BASH__
+}
+
+completion_zsh() {
+  cat <<'__ZSH__'
+#compdef adtool
+# Zsh completion for adtool. Maintainer: Carlos Andrade <carlos@perezandrade.com>
+# Generated by 'adtool completion zsh'; do not edit, change adtool instead.
+# Options come from 'adtool __flags' and names from 'adtool __complete'.
+
+_adtool() {
+  local bin=${words[1]} cmd line opt val desc flag="" value=""
+  local -a items names
+  local -A kinds
+  local kind
+
+  if (( CURRENT == 2 )); then
+    for line in ${(f)"$(command $bin __flags top 2>/dev/null)"}; do
+      opt=${line%%|*}; desc=${line##*|}
+      items+=("${opt}:${desc}")
+    done
+    _describe -t commands command items
+    return
+  fi
+
+  cmd=${words[2]}
+  case $cmd in
+    u) cmd=user ;; g) cmd=group ;; c|pc) cmd=computer ;; pw) cmd=password ;;
+  esac
+  case $cmd in
+    password|completion)
+      if (( CURRENT == 3 )); then
+        for line in ${(f)"$(command $bin __flags $cmd 2>/dev/null)"}; do
+          items+=("${line%%|*}:${line##*|}")
+        done
+        _describe -t arguments argument items
+      fi
+      return ;;
+    user|group|computer) ;;
+    *) return ;;
+  esac
+
+  for line in ${(f)"$(command $bin __flags $cmd 2>/dev/null)"}; do
+    opt=${line%%|*}; val=${${line#*|}%%|*}; desc=${line##*|}
+    kinds[$opt]=$val
+    items+=("${opt}:${desc}")
+  done
+
+  # --count=<TAB> and -c=<TAB>
+  if [[ $PREFIX == -*=* ]]; then
+    flag=${PREFIX%%=*}; value=${PREFIX#*=}
+    if [[ ${kinds[$flag]} == =* ]]; then
+      compadd -P "${flag}=" -- ${(s:,:)${kinds[$flag]#=}}
+      return
+    fi
+  fi
+
+  # the value of --dept / --title
+  flag=${words[CURRENT-1]}
+  case ${kinds[$flag]} in
+    @dept|@title)
+      kind=depts; [[ ${kinds[$flag]} == @title ]] && kind=titles
+      names=("${(@f)$(command $bin __complete $kind ${(Q)PREFIX} 2>/dev/null)}")
+      compadd -- ${names:#} ; return ;;
+    '#') return ;;
+  esac
+
+  if [[ $PREFIX == -* ]]; then
+    _describe -t options option items
+    return
+  fi
+
+  # a name: logins for an account action, otherwise what the command searches
+  local action=0 w
+  kind=users
+  for w in ${words[3,CURRENT-1]}; do
+    case $w in -r|--reset|-l|--lock|-u|--unlock) action=1 ;; esac
+  done
+  case $cmd in group) kind=groups ;; computer) kind=computers ;; esac
+  if [[ -z $PREFIX && $action == 0 ]]; then
+    _describe -t options option items
+  else
+    names=("${(@f)$(command $bin __complete $kind ${(Q)PREFIX} 2>/dev/null)}")
+    compadd -- ${names:#}
+  fi
+}
+
+if [[ $funcstack[1] == _adtool ]]; then
+  _adtool "$@"
+else
+  compdef _adtool adtool
+fi
+__ZSH__
+}
+
 case ${1:-} in
   user|u)          shift; cmd_user "$@" ;;
   group|g)         shift; cmd_group "$@" ;;
@@ -824,6 +1137,9 @@ case ${1:-} in
   policy|pol)      shift; cmd_policy ;;
   -V|--version)    printf '%s %s - Carlos Andrade  ---  carlos@perezandrade.com\n' "$PROG" "$VERSION" ;;
   whoami)          shift; cmd_whoami ;;
+  completion)      shift; cmd_completion "$@" ;;
+  __complete)      shift; cmd_complete "$@" ;;
+  __flags)         shift; flags_for "$@" ;;
   -h|--help|help)  usage ;;
   '')              usage; exit 1 ;;
   *)               die "unknown command '$1' (try $PROG --help)" ;;
